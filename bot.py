@@ -20,12 +20,17 @@ Run the bot using::
     uv run bot.py
 """
 
-import os
+from __future__ import annotations
 
+import asyncio
+import os
+import uuid
+
+import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import OutputTransportMessageUrgentFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -34,7 +39,6 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.runner.types import DailyRunnerArguments, RunnerArguments
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
@@ -42,6 +46,91 @@ from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
 
 load_dotenv(override=True)
+
+API_BASE = "https://api.gradient-bang.com/functions/v1"
+EMAIL = os.environ["GB_EMAIL"]
+PASSWORD = os.environ["GB_PASSWORD"]
+CHARACTER_NAME = os.environ.get("GB_CHARACTER", "HyperionBot")
+
+
+async def api_login(session: aiohttp.ClientSession) -> dict:
+    async with session.post(
+        f"{API_BASE}/login",
+        json={"email": EMAIL, "password": PASSWORD},
+    ) as response:
+        response.raise_for_status()
+        return await response.json()
+
+
+async def api_create_character(
+    session: aiohttp.ClientSession,
+    token: str,
+    name: str,
+) -> dict:
+    async with session.post(
+        f"{API_BASE}/user_character_create",
+        json={"name": name},
+        headers={"Authorization": f"Bearer {token}"},
+    ) as response:
+        response.raise_for_status()
+        return await response.json()
+
+
+async def api_start_bot(
+    session: aiohttp.ClientSession,
+    token: str,
+    character_id: str,
+) -> dict:
+    async with session.post(
+        f"{API_BASE}/start",
+        json={
+            "createDailyRoom": True,
+            "dailyRoomProperties": {
+                "start_video_off": True,
+                "eject_at_room_exp": True,
+            },
+            "body": {
+                "character_id": character_id,
+                "bypass_tutorial": True,
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    ) as response:
+        response.raise_for_status()
+        return await response.json()
+
+
+async def login_and_start() -> tuple[str, str]:
+    """Login, select/create character, start a session, and return Daily credentials."""
+    logger.info("[1] Logging in...")
+    async with aiohttp.ClientSession() as session:
+        login_data = await api_login(session)
+        token = login_data["session"]["access_token"]
+        characters = login_data.get("characters", [])
+        logger.info(f"    Logged in as {login_data['user']['email']}")
+
+        character_id = None
+        for character in characters:
+            if character["name"] == CHARACTER_NAME:
+                character_id = character["character_id"]
+                logger.info(f"    Using character: {CHARACTER_NAME} ({character_id})")
+                break
+
+        if not character_id:
+            logger.info(f"    Creating character: {CHARACTER_NAME}...")
+            result = await api_create_character(session, token, CHARACTER_NAME)
+            character_id = result["character_id"]
+            logger.info(f"    Created: {character_id}")
+
+        logger.info("[2] Starting game session...")
+        start_data = await api_start_bot(session, token, character_id)
+        room_url = start_data["dailyRoom"]
+        room_token = start_data["dailyToken"]
+        session_id = start_data.get("sessionId", "?")
+        logger.info(f"    Room: {room_url}")
+        logger.info(f"    Join: {room_url}?t={room_token}")
+        logger.info(f"    Session: {session_id}")
+        return room_url, room_token
 
 
 async def run_bot(transport: BaseTransport):
@@ -95,18 +184,26 @@ async def run_bot(transport: BaseTransport):
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        enable_rtvi=False,
         observers=[],
     )
 
-    @task.rtvi.event_handler("on_client_ready")
-    async def on_client_ready(rtvi):
-        # Kick off the conversation
-        context.add_message({"role": "user", "content": "Please introduce yourself."})
-        await task.queue_frames([LLMRunFrame()])
+    async def send_rtvi(msg_type: str, data: dict | None = None):
+        msg = {"label": "rtvi-ai", "type": msg_type, "id": uuid.uuid4().hex}
+        if data is not None:
+            msg["data"] = data
+        await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg)])
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Client connected")
+
+    @transport.event_handler("on_joined")
+    async def on_joined(transport, data):
+        logger.info("[DAILY] Joined room")
+        await asyncio.sleep(2)
+        logger.info("[RTVI] Sending client-ready...")
+        await send_rtvi("client-ready")
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
@@ -118,30 +215,20 @@ async def run_bot(transport: BaseTransport):
     await runner.run(task)
 
 
-async def bot(runner_args: RunnerArguments):
+async def bot():
     """Main bot entry point."""
-
-    transport = None
-
-    match runner_args:
-        case DailyRunnerArguments():
-            transport = DailyTransport(
-                runner_args.room_url,
-                runner_args.token,
-                "Pipecat Bot",
-                params=DailyParams(
-                    audio_in_enabled=True,
-                    audio_out_enabled=True,
-                ),
-            )
-        case _:
-            logger.error(f"Unsupported runner arguments type: {type(runner_args)}")
-            return
-
+    room_url, room_token = await login_and_start()
+    transport = DailyTransport(
+        room_url,
+        room_token,
+        "Pipecat Bot",
+        params=DailyParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+        ),
+    )
     await run_bot(transport)
 
 
 if __name__ == "__main__":
-    from pipecat.runner.run import main
-
-    main()
+    asyncio.run(bot())

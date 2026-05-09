@@ -24,30 +24,31 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import uuid
 
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import OutputTransportMessageUrgentFrame
+from pipecat.frames.frames import LLMMessagesAppendFrame, OutputTransportMessageUrgentFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
 
 load_dotenv(override=True)
 
-API_BASE = "https://api.gradient-bang.com/functions/v1"
+GB_ENV = os.environ.get("GB_ENV", "prod").strip().lower()
+API_BASES = {
+    "prod": os.environ.get("GB_API_BASE_PROD", "https://api.gradient-bang.com/functions/v1"),
+    "local": os.environ.get("GB_API_BASE_LOCAL", "http://127.0.0.1:54321/functions/v1"),
+}
+API_BASE = API_BASES.get(GB_ENV, API_BASES["prod"]).rstrip("/")
 EMAIL = os.environ["GB_EMAIL"]
 PASSWORD = os.environ["GB_PASSWORD"]
 CHARACTER_NAME = os.environ.get("GB_CHARACTER", "HyperionBot")
@@ -102,7 +103,7 @@ async def api_start_bot(
 
 async def login_and_start() -> tuple[str, str]:
     """Login, select/create character, start a session, and return Daily credentials."""
-    logger.info("[1] Logging in...")
+    logger.info(f"[1] Logging in ({GB_ENV}, {API_BASE})...")
     async with aiohttp.ClientSession() as session:
         login_data = await api_login(session)
         token = login_data["session"]["access_token"]
@@ -137,9 +138,6 @@ async def run_bot(transport: BaseTransport):
     """Main bot logic."""
     logger.info("Starting bot")
 
-    # Speech-to-Text service
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-
     # Text-to-Speech service
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY"),
@@ -153,23 +151,17 @@ async def run_bot(transport: BaseTransport):
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAILLMService.Settings(
             model=os.getenv("OPENAI_MODEL", "gpt-4.1"),
-            system_instruction="You are a helpful assistant in a voice conversation. Your responses will be spoken aloud, so avoid emojis, bullet points, or other formatting that can't be spoken. Respond to what the user said in a creative, helpful, and brief way.",
+            system_instruction="You are a helpful assistant in a voice conversation. Your responses will be spoken aloud, so avoid emojis, bullet points, or other formatting that can't be spoken. Reply with exactly one short sentence unless the user explicitly asks for more detail.",
         ),
     )
 
     context = LLMContext()
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
-    )
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
 
     # Pipeline - assembled from reusable components
     pipeline = Pipeline(
         [
             transport.input(),
-            stt,
             user_aggregator,
             llm,
             tts,
@@ -194,9 +186,99 @@ async def run_bot(transport: BaseTransport):
             msg["data"] = data
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg)])
 
+    class GameTurnBuffer:
+        def __init__(self):
+            self._reset()
+
+        def _reset(self):
+            self._collecting = False
+            self._transcriptions: list[str] = []
+            self._sentences: list[str] = []
+            self._tts_words: list[str] = []
+
+        def _ensure_collecting(self):
+            if not self._collecting:
+                self._reset()
+                self._collecting = True
+
+        def _append_unique(self, items: list[str], text: str):
+            text = text.strip()
+            if text and (not items or items[-1] != text):
+                items.append(text)
+
+        def handle_message(self, message: dict) -> str | None:
+            msg_type = message.get("type")
+            data = message.get("data") or {}
+
+            if msg_type in ("bot-transcription",):
+                self._ensure_collecting()
+                self._append_unique(self._transcriptions, data.get("text", ""))
+                return None
+
+            if msg_type == "bot-output":
+                text = data.get("text", "")
+                aggregated_by = data.get("aggregated_by")
+                self._ensure_collecting()
+                if aggregated_by == "sentence":
+                    self._append_unique(self._sentences, text)
+                elif aggregated_by == "word" and data.get("spoken"):
+                    self._append_unique(self._tts_words, text)
+                return None
+
+            if msg_type == "bot-tts-text":
+                self._ensure_collecting()
+                self._append_unique(self._tts_words, data.get("text", ""))
+                return None
+
+            if msg_type == "bot-stopped-speaking":
+                return self.flush()
+
+            if (
+                msg_type == "server-message"
+                and data.get("event") == "ship.speech_stopped"
+            ):
+                return self.flush()
+
+            return None
+
+        def flush(self) -> str | None:
+            if self._transcriptions:
+                text = " ".join(self._transcriptions)
+            elif self._sentences:
+                text = " ".join(self._sentences)
+            elif self._tts_words:
+                text = " ".join(self._tts_words)
+                text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+            else:
+                text = ""
+
+            self._reset()
+            text = " ".join(text.split())
+            return text or None
+
+    game_turns = GameTurnBuffer()
+
+    async def queue_game_turn(text: str):
+        logger.info(f"[GAME TURN] {text}")
+        await task.queue_frames(
+            [
+                LLMMessagesAppendFrame(
+                    messages=[{"role": "user", "content": text}],
+                    run_llm=True,
+                )
+            ]
+        )
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Client connected")
+
+    @transport.event_handler("on_app_message")
+    async def on_app_message(transport, message, sender):
+        logger.info(f"[APP MESSAGE][{sender}] {message}")
+        text = game_turns.handle_message(message)
+        if text:
+            await queue_game_turn(text)
 
     @transport.event_handler("on_joined")
     async def on_joined(transport, data):
@@ -223,7 +305,7 @@ async def bot():
         room_token,
         "Pipecat Bot",
         params=DailyParams(
-            audio_in_enabled=True,
+            audio_in_enabled=False,
             audio_out_enabled=True,
         ),
     )

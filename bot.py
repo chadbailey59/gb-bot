@@ -142,7 +142,7 @@ async def run_bot(transport: BaseTransport):
     tts = CartesiaTTSService(
         api_key=os.getenv("CARTESIA_API_KEY"),
         settings=CartesiaTTSService.Settings(
-            voice=os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"),
+            voice=os.getenv("CARTESIA_VOICE_ID", "32b3f3c5-7171-46aa-abe7-b598964aa793"),
         ),
     )
 
@@ -151,7 +151,13 @@ async def run_bot(transport: BaseTransport):
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAILLMService.Settings(
             model=os.getenv("OPENAI_MODEL", "gpt-4.1"),
-            system_instruction="You are a helpful assistant in a voice conversation. Your responses will be spoken aloud, so avoid emojis, bullet points, or other formatting that can't be spoken. Reply with exactly one short sentence unless the user explicitly asks for more detail.",
+            system_instruction=(
+                "You are a profit-seeking commodity trader in the Gradient Bang game. "
+                "Your goal is to make as much money as possible by finding profitable commodity trades, "
+                "buying low, selling high, choosing efficient routes, and asking for market or cargo details when needed. "
+                "Your responses will be spoken aloud, so avoid emojis, bullet points, or formatting that can't be spoken. "
+                "Reply with exactly one short sentence unless the user explicitly asks for more detail."
+            ),
         ),
     )
 

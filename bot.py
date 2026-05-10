@@ -26,6 +26,7 @@ import asyncio
 import os
 import re
 import uuid
+from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
@@ -52,6 +53,11 @@ API_BASE = API_BASES.get(GB_ENV, API_BASES["prod"]).rstrip("/")
 EMAIL = os.environ["GB_EMAIL"]
 PASSWORD = os.environ["GB_PASSWORD"]
 CHARACTER_NAME = os.environ.get("GB_CHARACTER", "HyperionBot")
+SYSTEM_PROMPT_PATH = Path(__file__).with_name("system_prompt.md")
+
+
+def load_system_prompt() -> str:
+    return SYSTEM_PROMPT_PATH.read_text().strip()
 
 
 async def api_login(session: aiohttp.ClientSession) -> dict:
@@ -140,7 +146,7 @@ async def run_bot(transport: BaseTransport):
 
     # Text-to-Speech service
     tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
+        api_key=os.environ["CARTESIA_API_KEY"],
         settings=CartesiaTTSService.Settings(
             voice=os.getenv("CARTESIA_VOICE_ID", "32b3f3c5-7171-46aa-abe7-b598964aa793"),
         ),
@@ -151,13 +157,7 @@ async def run_bot(transport: BaseTransport):
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAILLMService.Settings(
             model=os.getenv("OPENAI_MODEL", "gpt-4.1"),
-            system_instruction=(
-                "You are a profit-seeking commodity trader in the Gradient Bang game. "
-                "Your goal is to make as much money as possible by finding profitable commodity trades, "
-                "buying low, selling high, choosing efficient routes, and asking for market or cargo details when needed. "
-                "Your responses will be spoken aloud, so avoid emojis, bullet points, or formatting that can't be spoken. "
-                "Reply with exactly one short sentence unless the user explicitly asks for more detail."
-            ),
+            system_instruction=load_system_prompt(),
         ),
     )
 
@@ -187,7 +187,7 @@ async def run_bot(transport: BaseTransport):
     )
 
     async def send_rtvi(msg_type: str, data: dict | None = None):
-        msg = {"label": "rtvi-ai", "type": msg_type, "id": uuid.uuid4().hex}
+        msg: dict[str, object] = {"label": "rtvi-ai", "type": msg_type, "id": uuid.uuid4().hex}
         if data is not None:
             msg["data"] = data
         await task.queue_frames([OutputTransportMessageUrgentFrame(message=msg)])

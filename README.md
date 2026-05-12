@@ -38,17 +38,44 @@ A Pipecat AI voice agent built with a cascade pipeline (STT → LLM → TTS).
 
    - Daily: `uv run bot.py --transport daily`
 
+   To join an existing Daily room instead of creating a new game session:
+
+   ```bash
+   uv run bot.py --room-url "https://your-domain.daily.co/room-name" --token "DAILY_TOKEN"
+   ```
+
+   A Daily join URL with `?t=` also works; the bot extracts the token and joins the
+   room URL without the token query parameter:
+
+   ```bash
+   uv run bot.py --room-url "https://your-domain.daily.co/room-name?t=DAILY_TOKEN"
+   ```
+
+## Prompt Structure
+
+The bot composes its LLM system instruction from two files:
+
+- `system_prompt.md`: reusable game rules, safety guidance, and command style.
+- `task_prompts/trading.md`: the default task-specific prompt for trading profitably.
+
+Set `GB_TASK_PROMPT_PATH` to use a different task prompt, such as exploration or combat:
+
+```bash
+GB_TASK_PROMPT_PATH=task_prompts/exploration.md uv run bot.py --transport daily
+```
+
 ## Project Structure
 
 ```
 gb-bot/
-├── server/              # Python bot server
-│   ├── bot.py           # Main bot implementation
-│   ├── pyproject.toml   # Python dependencies
-│   ├── .env.example     # Environment variables template
-│   ├── .env             # Your API keys (git-ignored)
-│   ├── Dockerfile       # Container image for Pipecat Cloud
-│   └── pcc-deploy.toml  # Pipecat Cloud deployment config
+├── bot.py                  # Main bot implementation
+├── system_prompt.md        # General Gradient Bang instructions
+├── task_prompts/
+│   └── trading.md          # Default task-specific instructions
+├── pyproject.toml          # Python dependencies
+├── Dockerfile              # Container image for Pipecat Cloud
+├── pcc-deploy.toml         # Pipecat Cloud deployment config
+├── uv.lock                 # Locked Python dependencies
 ├── .gitignore           # Git ignore patterns
 └── README.md            # This file
 ```

@@ -22,25 +22,32 @@ Run the bot using::
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import re
 import sys
+import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.frames.frames import (
     Frame,
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMMessagesAppendFrame,
     LLMTextFrame,
     OutputTransportMessageUrgentFrame,
+    UserStartedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -74,14 +81,73 @@ API_BASES = {
     "local": os.environ.get("GB_API_BASE_LOCAL", "http://127.0.0.1:54321/functions/v1"),
 }
 API_BASE = API_BASES.get(GB_ENV, API_BASES["prod"]).rstrip("/")
-EMAIL = os.environ["GB_EMAIL"]
-PASSWORD = os.environ["GB_PASSWORD"]
+EMAIL = os.environ.get("GB_EMAIL")
+PASSWORD = os.environ.get("GB_PASSWORD")
 CHARACTER_NAME = os.environ.get("GB_CHARACTER", "HyperionBot")
 SYSTEM_PROMPT_PATH = Path(__file__).with_name("system_prompt.md")
+TASK_PROMPT_PATH = Path(
+    os.environ.get(
+        "GB_TASK_PROMPT_PATH",
+        Path(__file__).with_name("task_prompts") / "trading.md",
+    )
+)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the Gradient Bang Daily voice bot.")
+    parser.add_argument(
+        "--transport",
+        choices=["daily"],
+        default="daily",
+        help="Transport to use. Only daily is currently supported.",
+    )
+    parser.add_argument(
+        "--room-url",
+        help="Existing Daily room URL to join instead of creating a new game session.",
+    )
+    parser.add_argument(
+        "--token",
+        help="Daily meeting token for --room-url. A t= query param in --room-url is also accepted.",
+    )
+    args = parser.parse_args(argv)
+    if args.token and not args.room_url:
+        parser.error("--token requires --room-url")
+    return args
+
+
+def resolve_daily_room(room_url: str, token: str | None = None) -> tuple[str, str | None]:
+    """Return a clean Daily room URL and token, extracting t= from the URL when present."""
+    parsed_url = urlsplit(room_url)
+    query_params = parse_qsl(parsed_url.query, keep_blank_values=True)
+    url_tokens = [value for key, value in query_params if key == "t"]
+
+    if url_tokens:
+        url_token = url_tokens[-1]
+        if token and token != url_token:
+            raise ValueError(
+                "Daily token was provided by both --token and --room-url?t= with different values"
+            )
+        token = url_token
+        query_params = [(key, value) for key, value in query_params if key != "t"]
+        room_url = urlunsplit(
+            (
+                parsed_url.scheme,
+                parsed_url.netloc,
+                parsed_url.path,
+                urlencode(query_params, doseq=True),
+                parsed_url.fragment,
+            )
+        )
+
+    return room_url, token
 
 
 def load_system_prompt() -> str:
-    return SYSTEM_PROMPT_PATH.read_text().strip()
+    prompt_parts = [
+        SYSTEM_PROMPT_PATH.read_text().strip(),
+        TASK_PROMPT_PATH.read_text().strip(),
+    ]
+    return "\n\n".join(part for part in prompt_parts if part)
 
 
 COMMODITIES = (
@@ -286,9 +352,7 @@ class GameContextStore:
             stock = self._dict(port.get("stock"))
             trade = self._format_trade_code(code, prices)
             stock_text = self._format_stock(stock)
-            summaries.append(
-                f"{sector.get('id')} ({hops} hops,{mega} {code}): {trade}{stock_text}"
-            )
+            summaries.append(f"{sector.get('id')} ({hops} hops,{mega} {code}): {trade}{stock_text}")
 
         if not summaries:
             return None
@@ -400,7 +464,11 @@ class GameContextStore:
             owner = garrison.get("owner_name") or garrison.get("owner") or garrison.get("owner_id")
             mode = garrison.get("mode") or garrison.get("garrison_mode")
             fighters = garrison.get("fighters")
-            bits = [self._clean(owner), self._clean(mode), f"fighters {fighters}" if fighters else None]
+            bits = [
+                self._clean(owner),
+                self._clean(mode),
+                f"fighters {fighters}" if fighters else None,
+            ]
             return "garrison " + " ".join(bit for bit in bits if bit)
         return "garrison present"
 
@@ -467,11 +535,7 @@ class GameContextInjector(FrameProcessor):
 
         original = dict(cast(dict[str, Any], messages[last_user_index]))
         original_content = cast(str, original["content"])
-        original["content"] = (
-            f"{game_context}\n\n"
-            "Most recent Ship AI speech:\n"
-            f"{original_content}"
-        )
+        original["content"] = f"{game_context}\n\nMost recent Ship AI speech:\n{original_content}"
         messages[last_user_index] = original
 
         enriched_context = LLMContext(
@@ -515,8 +579,9 @@ class BotSpeechLogger(FrameProcessor):
 class WaitTagFilter(FrameProcessor):
     """Suppresses the model's <wait> control response before it reaches TTS."""
 
-    def __init__(self):
+    def __init__(self, on_wait: Callable[[], None] | None = None):
         super().__init__()
+        self._on_wait = on_wait
         self._parts: list[str] = []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -536,6 +601,8 @@ class WaitTagFilter(FrameProcessor):
             self._parts.clear()
             if self._is_wait_tag(text):
                 logger.info("[BOT WAIT] Suppressing <wait> response while Ship AI task continues")
+                if self._on_wait:
+                    self._on_wait()
                 await self.push_frame(frame, direction)
                 return
             if text:
@@ -550,7 +617,98 @@ class WaitTagFilter(FrameProcessor):
         return normalized in {"<wait>", "<wait/>", "<wait></wait>"}
 
 
+class SpeechTimingState:
+    def __init__(self):
+        self.last_bot_stopped_at: float | None = None
+        self.user_speaking = False
+
+    def elapsed_since_bot_stopped(self, now: float, consume: bool = False) -> float | None:
+        if self.last_bot_stopped_at is None:
+            return None
+        elapsed = now - self.last_bot_stopped_at
+        if consume:
+            self.last_bot_stopped_at = None
+        return elapsed
+
+    def reset_for_wait_response(self):
+        if self.last_bot_stopped_at is not None:
+            logger.info("[SPEECH TIMING] Reset pending bot-stop timer after <wait> response")
+        self.last_bot_stopped_at = None
+        self.user_speaking = False
+
+
+class TransportSpeechTimingLogger(FrameProcessor):
+    """Logs speech boundary frames at the transport edges for latency measurement."""
+
+    def __init__(self, location: str, timing: SpeechTimingState):
+        super().__init__()
+        self._location = location
+        self._timing = timing
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        now = time.perf_counter()
+        if self._is_target_output_frame(frame, direction, BotStoppedSpeakingFrame):
+            self._timing.last_bot_stopped_at = now
+            self._timing.user_speaking = False
+            logger.info(
+                f"[SPEECH TIMING] BotStoppedSpeaking after {self._location} "
+                f"direction={direction.name}"
+            )
+        elif self._is_target_input_frame(frame, direction, UserStartedSpeakingFrame):
+            self._timing.user_speaking = True
+            elapsed = self._timing.elapsed_since_bot_stopped(now, consume=True)
+            if elapsed is None:
+                logger.info(
+                    f"[SPEECH TIMING] UserStartedSpeaking after {self._location} "
+                    f"direction={direction.name} elapsed_since_bot_stopped=unknown"
+                )
+            else:
+                logger.info(
+                    f"[SPEECH TIMING] UserStartedSpeaking after {self._location} "
+                    f"direction={direction.name} elapsed_since_bot_stopped={elapsed:.3f}s"
+                )
+        elif self._is_target_input_frame(frame, direction, BotStartedSpeakingFrame):
+            # Kept visible in case Pipecat emits this unexpectedly for the game side.
+            elapsed = self._timing.elapsed_since_bot_stopped(now)
+            elapsed_text = "unknown" if elapsed is None else f"{elapsed:.3f}s"
+            logger.info(
+                f"[SPEECH TIMING] BotStartedSpeaking after {self._location} "
+                f"direction={direction.name} elapsed_since_bot_stopped={elapsed_text}"
+            )
+
+        await self.push_frame(frame, direction)
+
+    def _is_target_output_frame(
+        self,
+        frame: Frame,
+        direction: FrameDirection,
+        frame_type: type[Frame],
+    ) -> bool:
+        return (
+            self._location == "transport output"
+            and direction == FrameDirection.DOWNSTREAM
+            and isinstance(frame, frame_type)
+        )
+
+    def _is_target_input_frame(
+        self,
+        frame: Frame,
+        direction: FrameDirection,
+        frame_type: type[Frame],
+    ) -> bool:
+        return (
+            self._location == "transport input"
+            and direction == FrameDirection.DOWNSTREAM
+            and isinstance(frame, frame_type)
+        )
+
+
 async def api_login(session: aiohttp.ClientSession) -> dict:
+    if not EMAIL or not PASSWORD:
+        raise RuntimeError("GB_EMAIL and GB_PASSWORD are required unless --room-url is provided")
+
     async with session.post(
         f"{API_BASE}/login",
         json={"email": EMAIL, "password": PASSWORD},
@@ -655,13 +813,23 @@ async def run_bot(transport: BaseTransport):
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
     game_context = GameContextStore()
     game_context_injector = GameContextInjector(game_context)
-    wait_tag_filter = WaitTagFilter()
+    speech_timing = SpeechTimingState()
+    wait_tag_filter = WaitTagFilter(on_wait=speech_timing.reset_for_wait_response)
     bot_speech_logger = BotSpeechLogger()
+    transport_input_timing_logger = TransportSpeechTimingLogger(
+        "transport input",
+        speech_timing,
+    )
+    transport_output_timing_logger = TransportSpeechTimingLogger(
+        "transport output",
+        speech_timing,
+    )
 
     # Pipeline - assembled from reusable components
     pipeline = Pipeline(
         [
             transport.input(),
+            transport_input_timing_logger,
             user_aggregator,
             game_context_injector,
             llm,
@@ -669,6 +837,7 @@ async def run_bot(transport: BaseTransport):
             bot_speech_logger,
             tts,
             transport.output(),
+            transport_output_timing_logger,
             assistant_aggregator,
         ]
     )
@@ -736,10 +905,7 @@ async def run_bot(transport: BaseTransport):
             if msg_type == "bot-stopped-speaking":
                 return self.flush()
 
-            if (
-                msg_type == "server-message"
-                and data.get("event") == "ship.speech_stopped"
-            ):
+            if msg_type == "server-message" and data.get("event") == "ship.speech_stopped":
                 return self.flush()
 
             return None
@@ -761,6 +927,30 @@ async def run_bot(transport: BaseTransport):
 
     game_turns = GameTurnBuffer()
 
+    def log_game_user_speech_boundary(message: dict):
+        msg_type = message.get("type")
+        data = message.get("data") or {}
+        event = data.get("event") if msg_type == "server-message" else None
+
+        if msg_type in ("bot-started-speaking", "bot-output", "bot-tts-text", "bot-transcription"):
+            log_game_user_started(f"app_message type={msg_type}")
+        elif event == "ship.speech_started":
+            log_game_user_started("app_message event=ship.speech_started")
+        elif msg_type == "bot-stopped-speaking" or event == "ship.speech_stopped":
+            speech_timing.user_speaking = False
+
+    def log_game_user_started(source: str):
+        if speech_timing.user_speaking:
+            return
+
+        speech_timing.user_speaking = True
+        elapsed = speech_timing.elapsed_since_bot_stopped(time.perf_counter(), consume=True)
+        elapsed_text = "unknown" if elapsed is None else f"{elapsed:.3f}s"
+        logger.info(
+            f"[SPEECH TIMING] UserStartedSpeaking from {source} "
+            f"elapsed_since_bot_stopped={elapsed_text}"
+        )
+
     async def queue_game_turn(text: str):
         logger.info(f"[GAME TURN] {text}")
         await task.queue_frames(
@@ -779,6 +969,7 @@ async def run_bot(transport: BaseTransport):
     @transport.event_handler("on_app_message")
     async def on_app_message(transport, message, sender):
         logger.debug(f"[APP MESSAGE][{sender}] {message}")
+        log_game_user_speech_boundary(message)
         game_context.handle_message(message)
         text = game_turns.handle_message(message)
         if text:
@@ -803,11 +994,22 @@ async def run_bot(transport: BaseTransport):
 
 async def bot():
     """Main bot entry point."""
-    room_url, room_token = await login_and_start()
+    args = parse_args()
+    if args.room_url:
+        try:
+            room_url, room_token = resolve_daily_room(args.room_url, args.token)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        logger.info("[1] Joining existing Daily room...")
+        logger.info(f"    Room: {room_url}")
+        logger.info(f"    Token: {'provided' if room_token else 'none'}")
+    else:
+        room_url, room_token = await login_and_start()
+
     transport = DailyTransport(
         room_url,
         room_token,
-        "Pipecat Bot",
+        "Gradient Bang Player Bot",
         params=DailyParams(
             audio_in_enabled=False,
             audio_out_enabled=True,

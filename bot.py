@@ -25,24 +25,48 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sys
 import uuid
 from pathlib import Path
+from typing import Any, cast
 
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from pipecat.frames.frames import LLMMessagesAppendFrame, OutputTransportMessageUrgentFrame
+from pipecat.frames.frames import (
+    Frame,
+    LLMContextFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMMessagesAppendFrame,
+    LLMTextFrame,
+    OutputTransportMessageUrgentFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
 
 load_dotenv(override=True)
+
+
+def configure_logging():
+    log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    logger.remove()
+    try:
+        logger.add(sys.stderr, level=log_level)
+    except ValueError:
+        logger.add(sys.stderr, level="INFO")
+        logger.warning(f"Invalid LOG_LEVEL={log_level!r}; defaulting to INFO")
+
+
+configure_logging()
 
 GB_ENV = os.environ.get("GB_ENV", "prod").strip().lower()
 API_BASES = {
@@ -58,6 +82,472 @@ SYSTEM_PROMPT_PATH = Path(__file__).with_name("system_prompt.md")
 
 def load_system_prompt() -> str:
     return SYSTEM_PROMPT_PATH.read_text().strip()
+
+
+COMMODITIES = (
+    ("quantum_foam", "QF"),
+    ("retro_organics", "RO"),
+    ("neuro_symbolics", "NS"),
+)
+
+
+class GameContextStore:
+    """Accumulates useful structured game state from incoming server messages."""
+
+    def __init__(self):
+        self._status: str | None = None
+        self._ships: str | None = None
+        self._map: str | None = None
+        self._ports: str | None = None
+        self._quests: str | None = None
+        self._ui_summary: str | None = None
+        self._recent_events: list[str] = []
+
+    def handle_message(self, message: dict[str, Any]):
+        if message.get("type") != "server-message":
+            return
+
+        data = message.get("data") or {}
+        event = data.get("event")
+        payload = data.get("payload") or {}
+        if not isinstance(event, str) or not isinstance(payload, dict):
+            return
+
+        if event in ("status.snapshot", "status.update"):
+            self._status = self._log_context_update(event, self._summarize_status(payload))
+        elif event == "ships.list":
+            self._ships = self._log_context_update(event, self._summarize_ships(payload))
+        elif event == "map.local":
+            self._map = self._log_context_update(event, self._summarize_map(payload))
+        elif event == "ports.list":
+            self._ports = self._log_context_update(event, self._summarize_ports(payload))
+        elif event == "quest.status":
+            self._quests = self._log_context_update(event, self._summarize_quests(payload))
+        elif event == "ui-agent-context-summary":
+            summary = payload.get("context_summary")
+            if isinstance(summary, str) and summary.strip():
+                self._ui_summary = self._log_context_update(event, summary.strip())
+        elif self._is_recent_event(event):
+            self._append_recent_event(event, self._summarize_generic_event(event, payload))
+
+    def render(self) -> str:
+        sections = [
+            self._status,
+            self._ships,
+            self._ports,
+            self._map,
+            self._quests,
+            self._format_recent_events(),
+            self._format_ui_summary(),
+        ]
+        body = "\n".join(section for section in sections if section)
+        if not body:
+            return ""
+        return f"Game context from server messages:\n{body}"
+
+    def _log_context_update(self, event: str, summary: str | None) -> str | None:
+        if summary:
+            logger.debug(f"[GAME CONTEXT][{event}]\n{summary}")
+        return summary
+
+    def _append_recent_event(self, event: str, summary: str):
+        if summary and (not self._recent_events or self._recent_events[-1] != summary):
+            self._recent_events.append(summary)
+            self._recent_events = self._recent_events[-6:]
+            logger.debug(f"[GAME CONTEXT][{event}]\nRecent events += {summary}")
+
+    def _format_recent_events(self) -> str | None:
+        if not self._recent_events:
+            return None
+        return "Recent events: " + " | ".join(self._recent_events)
+
+    def _format_ui_summary(self) -> str | None:
+        if not self._ui_summary:
+            return None
+        return f"UI summary: {self._ui_summary}"
+
+    def _summarize_status(self, payload: dict[str, Any]) -> str:
+        ship = self._dict(payload.get("ship"))
+        sector = self._dict(payload.get("sector"))
+        player = self._dict(payload.get("player"))
+        port = self._dict(sector.get("port"))
+
+        ship_bits = [
+            self._clean(ship.get("ship_name")),
+            f"type {ship.get('ship_type')}" if ship.get("ship_type") else None,
+            f"sector {sector.get('id')}" if sector.get("id") is not None else None,
+            self._clean(sector.get("region")),
+            self._format_pair("warp", ship.get("warp_power"), ship.get("warp_power_capacity")),
+            f"turns/warp {ship.get('turns_per_warp')}" if ship.get("turns_per_warp") else None,
+            self._format_pair("shields", ship.get("shields"), ship.get("max_shields")),
+            self._format_pair("fighters", ship.get("fighters"), ship.get("max_fighters")),
+            f"ship credits {ship.get('credits')}" if ship.get("credits") is not None else None,
+            (
+                f"bank {player.get('credits_in_bank')}"
+                if player.get("credits_in_bank") is not None
+                else None
+            ),
+            self._format_cargo(ship),
+        ]
+
+        sector_bits = [
+            self._format_port(port),
+            self._format_adjacent(sector),
+            self._format_presence("players", sector.get("players")),
+            self._format_presence("salvage", sector.get("salvage")),
+            self._format_garrison(sector.get("garrison")),
+        ]
+
+        return self._join_lines(
+            "Current status: " + "; ".join(bit for bit in ship_bits if bit),
+            "Current sector: " + "; ".join(bit for bit in sector_bits if bit),
+        )
+
+    def _summarize_ships(self, payload: dict[str, Any]) -> str | None:
+        ships = self._list(payload.get("ships"))
+        if not ships:
+            return None
+
+        summaries = []
+        for ship in ships[:5]:
+            if not isinstance(ship, dict):
+                continue
+            bits = [
+                self._clean(ship.get("ship_name")) or self._clean(ship.get("ship_type")),
+                f"sector {ship.get('sector')}" if ship.get("sector") is not None else None,
+                self._format_pair("warp", ship.get("warp_power"), ship.get("warp_power_capacity")),
+                f"credits {ship.get('credits')}" if ship.get("credits") is not None else None,
+                self._format_cargo(ship),
+                f"task {ship.get('current_task_id')}" if ship.get("current_task_id") else None,
+                "destroyed" if ship.get("destroyed_at") else None,
+            ]
+            summaries.append("; ".join(bit for bit in bits if bit))
+
+        if not summaries:
+            return None
+        return "Owned ships: " + " | ".join(summaries)
+
+    def _summarize_map(self, payload: dict[str, Any]) -> str | None:
+        sectors = self._list(payload.get("sectors"))
+        if not sectors:
+            return None
+
+        ports = []
+        megaports = []
+        garrisons = []
+        unvisited = []
+        one_way_lanes = []
+        for sector in sectors:
+            if not isinstance(sector, dict):
+                continue
+            sector_id = sector.get("id")
+            hops = sector.get("hops_from_center")
+            port = self._dict(sector.get("port"))
+            if port:
+                label = f"{sector_id} ({hops} hops, {port.get('code')})"
+                ports.append(label)
+                if port.get("mega"):
+                    megaports.append(label)
+            if sector.get("garrison"):
+                garrisons.append(f"{sector_id} ({hops} hops)")
+            if sector.get("visited") is False:
+                unvisited.append(f"{sector_id} ({hops} hops)")
+            for lane in self._list(sector.get("lanes")):
+                if isinstance(lane, dict) and lane.get("two_way") is False:
+                    one_way_lanes.append(f"{sector_id}->{lane.get('to')}")
+
+        bits = [
+            f"center {payload.get('center_sector')}" if payload.get("center_sector") else None,
+            self._format_limited("megaports", megaports, 4),
+            self._format_limited("ports", ports, 10),
+            self._format_limited("garrisons", garrisons, 5),
+            self._format_limited("unvisited", unvisited, 8),
+            self._format_limited("one-way lanes", one_way_lanes, 8),
+        ]
+        return "Local map: " + "; ".join(bit for bit in bits if bit)
+
+    def _summarize_ports(self, payload: dict[str, Any]) -> str | None:
+        ports = self._list(payload.get("ports"))
+        if not ports:
+            return "Known ports: none found."
+
+        summaries = []
+        for entry in ports[:12]:
+            if not isinstance(entry, dict):
+                continue
+            sector = self._dict(entry.get("sector"))
+            port = self._dict(sector.get("port"))
+            if not sector or not port:
+                continue
+            code = self._clean(port.get("code"))
+            mega = " mega" if port.get("mega") else ""
+            hops = entry.get("hops_from_start")
+            prices = self._dict(port.get("prices"))
+            stock = self._dict(port.get("stock"))
+            trade = self._format_trade_code(code, prices)
+            stock_text = self._format_stock(stock)
+            summaries.append(
+                f"{sector.get('id')} ({hops} hops,{mega} {code}): {trade}{stock_text}"
+            )
+
+        if not summaries:
+            return None
+        return "Known ports near current sector: " + " | ".join(summaries)
+
+    def _summarize_quests(self, payload: dict[str, Any]) -> str | None:
+        quests = self._list(payload.get("quests"))
+        if not quests:
+            return "Quests: none active."
+
+        summaries = []
+        for quest in quests[:5]:
+            if not isinstance(quest, dict):
+                continue
+            name = self._clean(quest.get("name") or quest.get("code") or quest.get("quest_id"))
+            if name:
+                summaries.append(name)
+        if not summaries:
+            return None
+        return "Quests: " + "; ".join(summaries)
+
+    def _summarize_generic_event(self, event: str, payload: dict[str, Any]) -> str:
+        useful_keys = (
+            "status",
+            "sector",
+            "from_sector",
+            "to_sector",
+            "commodity",
+            "quantity",
+            "profit",
+            "credits",
+            "warp_power",
+            "task_id",
+            "action",
+            "result",
+        )
+        bits = []
+        for key in useful_keys:
+            if key in payload and self._is_scalar(payload[key]):
+                bits.append(f"{key}={payload[key]}")
+        if bits:
+            return f"{event}: " + ", ".join(bits)
+        return event
+
+    def _is_recent_event(self, event: str) -> bool:
+        prefixes = (
+            "task.",
+            "trade.",
+            "movement.",
+            "combat.",
+            "ship.",
+            "bank.",
+            "transfer.",
+            "recharge.",
+            "character.",
+        )
+        ignored = {"ship.speech_started", "ship.speech_stopped"}
+        return event not in ignored and event.startswith(prefixes)
+
+    def _format_port(self, port: dict[str, Any]) -> str | None:
+        code = self._clean(port.get("code"))
+        if not code:
+            return None
+        mega = " mega" if port.get("mega") else ""
+        return f"port{mega} {code}: {self._format_trade_code(code, self._dict(port.get('prices')))}"
+
+    def _format_trade_code(self, code: str | None, prices: dict[str, Any]) -> str:
+        parts = []
+        for index, (key, label) in enumerate(COMMODITIES):
+            action = code[index] if code and len(code) > index else "?"
+            verb = "buys" if action == "B" else "sells" if action == "S" else "has"
+            price = prices.get(key)
+            parts.append(f"{verb} {label}@{price}" if price is not None else f"{verb} {label}")
+        return ", ".join(parts)
+
+    def _format_stock(self, stock: dict[str, Any]) -> str:
+        if not stock:
+            return ""
+        values = []
+        for key, label in COMMODITIES:
+            if stock.get(key) is not None:
+                values.append(f"{label} {stock[key]}")
+        return f"; stock {', '.join(values)}" if values else ""
+
+    def _format_cargo(self, ship: dict[str, Any]) -> str | None:
+        cargo = self._dict(ship.get("cargo"))
+        if not cargo:
+            return None
+        capacity = ship.get("cargo_capacity")
+        empty = ship.get("empty_holds")
+        values = [f"{label} {cargo.get(key, 0)}" for key, label in COMMODITIES]
+        prefix = f"cargo {', '.join(values)}"
+        if capacity is not None:
+            prefix += f" / {capacity}"
+        if empty is not None:
+            prefix += f" ({empty} empty)"
+        return prefix
+
+    def _format_adjacent(self, sector: dict[str, Any]) -> str | None:
+        adjacent = self._dict(sector.get("adjacent_sectors"))
+        if not adjacent:
+            return None
+        return "adjacent " + ", ".join(str(key) for key in adjacent.keys())
+
+    def _format_garrison(self, garrison: object) -> str | None:
+        if not garrison:
+            return "no garrison"
+        if isinstance(garrison, dict):
+            owner = garrison.get("owner_name") or garrison.get("owner") or garrison.get("owner_id")
+            mode = garrison.get("mode") or garrison.get("garrison_mode")
+            fighters = garrison.get("fighters")
+            bits = [self._clean(owner), self._clean(mode), f"fighters {fighters}" if fighters else None]
+            return "garrison " + " ".join(bit for bit in bits if bit)
+        return "garrison present"
+
+    def _format_presence(self, label: str, value: object) -> str | None:
+        items = self._list(value)
+        if not items:
+            return f"no {label}"
+        return f"{label} present ({len(items)})"
+
+    def _format_pair(self, label: str, current: object, maximum: object) -> str | None:
+        if current is None and maximum is None:
+            return None
+        if maximum is None:
+            return f"{label} {current}"
+        return f"{label} {current}/{maximum}"
+
+    def _format_limited(self, label: str, values: list[str], limit: int) -> str | None:
+        if not values:
+            return None
+        shown = values[:limit]
+        suffix = f" (+{len(values) - limit} more)" if len(values) > limit else ""
+        return f"{label}: {', '.join(shown)}{suffix}"
+
+    def _join_lines(self, *lines: str | None) -> str:
+        return "\n".join(line for line in lines if line)
+
+    def _dict(self, value: object) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    def _list(self, value: object) -> list[Any]:
+        return value if isinstance(value, list) else []
+
+    def _clean(self, value: object) -> str | None:
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def _is_scalar(self, value: object) -> bool:
+        return isinstance(value, str | int | float | bool) or value is None
+
+
+class GameContextInjector(FrameProcessor):
+    """Injects current game context into the latest user message before the LLM."""
+
+    def __init__(self, game_context: GameContextStore):
+        super().__init__()
+        self._game_context = game_context
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if not isinstance(frame, LLMContextFrame):
+            await self.push_frame(frame, direction)
+            return
+
+        game_context = self._game_context.render()
+        if not game_context:
+            await self.push_frame(frame, direction)
+            return
+
+        messages: list[Any] = list(frame.context.get_messages())
+        last_user_index = self._find_last_user_text_message(messages)
+        if last_user_index is None:
+            await self.push_frame(frame, direction)
+            return
+
+        original = dict(cast(dict[str, Any], messages[last_user_index]))
+        original_content = cast(str, original["content"])
+        original["content"] = (
+            f"{game_context}\n\n"
+            "Most recent Ship AI speech:\n"
+            f"{original_content}"
+        )
+        messages[last_user_index] = original
+
+        enriched_context = LLMContext(
+            messages=messages,
+            tools=frame.context.tools,
+            tool_choice=frame.context.tool_choice,
+        )
+        await self.push_frame(LLMContextFrame(enriched_context), direction)
+
+    def _find_last_user_text_message(self, messages: list[Any]) -> int | None:
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "user" and isinstance(message.get("content"), str):
+                return index
+        return None
+
+
+class BotSpeechLogger(FrameProcessor):
+    """Logs the bot's streamed LLM response as a single spoken utterance."""
+
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMTextFrame):
+            self._parts.append(frame.text)
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            text = " ".join("".join(self._parts).split())
+            if text:
+                logger.info(f"[BOT SPEECH] {text}")
+            self._parts.clear()
+
+        await self.push_frame(frame, direction)
+
+
+class WaitTagFilter(FrameProcessor):
+    """Suppresses the model's <wait> control response before it reaches TTS."""
+
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self._parts.clear()
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, LLMTextFrame):
+            self._parts.append(frame.text)
+            return
+
+        if isinstance(frame, LLMFullResponseEndFrame):
+            text = "".join(self._parts)
+            self._parts.clear()
+            if self._is_wait_tag(text):
+                logger.info("[BOT WAIT] Suppressing <wait> response while Ship AI task continues")
+                await self.push_frame(frame, direction)
+                return
+            if text:
+                await self.push_frame(LLMTextFrame(text), direction)
+            await self.push_frame(frame, direction)
+            return
+
+        await self.push_frame(frame, direction)
+
+    def _is_wait_tag(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text.strip().lower())
+        return normalized in {"<wait>", "<wait/>", "<wait></wait>"}
 
 
 async def api_login(session: aiohttp.ClientSession) -> dict:
@@ -163,13 +653,20 @@ async def run_bot(transport: BaseTransport):
 
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
+    game_context = GameContextStore()
+    game_context_injector = GameContextInjector(game_context)
+    wait_tag_filter = WaitTagFilter()
+    bot_speech_logger = BotSpeechLogger()
 
     # Pipeline - assembled from reusable components
     pipeline = Pipeline(
         [
             transport.input(),
             user_aggregator,
+            game_context_injector,
             llm,
+            wait_tag_filter,
+            bot_speech_logger,
             tts,
             transport.output(),
             assistant_aggregator,
@@ -281,7 +778,8 @@ async def run_bot(transport: BaseTransport):
 
     @transport.event_handler("on_app_message")
     async def on_app_message(transport, message, sender):
-        logger.info(f"[APP MESSAGE][{sender}] {message}")
+        logger.debug(f"[APP MESSAGE][{sender}] {message}")
+        game_context.handle_message(message)
         text = game_turns.handle_message(message)
         if text:
             await queue_game_turn(text)

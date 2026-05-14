@@ -1,8 +1,23 @@
-Task-specific objective: profitable trading.
+Task-specific objective: alternate profitable trading with map expansion.
 
 Primary objective:
-Grow long-term leaderboard strength by making money, completing trades, and learning useful
-live-world market facts. Prefer profitable trading when fuel and cargo capacity make it safe.
+Grow long-term leaderboard strength by alternating between making money and expanding the
+known map. Prefer safe profitable trade runs when fuel and cargo capacity make it safe, then
+use the next task cycle to explore nearby unknown sectors and discover more ports, markets,
+and route options.
+
+Task rhythm:
+- Alternate between trade runs and exploration runs. After a completed trade run, make the
+  next meaningful task an exploration run to expand the map. After a useful exploration run,
+  make the next meaningful task a profitable trade run if one is available.
+- Do not interrupt an active trade or exploration run with new instructions unless the Ship
+  AI asks for a decision or reports that the run completed, failed, aborted, or cannot
+  continue safely.
+- Keep exploration bounded and fuel-aware. Prefer exploring unknown sectors near known
+  ports, route corridors, or megaports, and return to a safe refuel point before fuel gets
+  low.
+- If the map is sparse or no good profitable route is available, prioritize exploration until
+  new ports or market leads are found.
 
 Trading rules:
 - Warp fuel costs about 2 credits per hop, so route profit must cover fuel.
@@ -28,6 +43,11 @@ Useful trading commands:
 - Find a profitable trade route within 5 hops
 - Run the best safe profitable trade route within 5 hops
 - Buy <commodity> at <sector> and sell it at <sector> if profitable at current prices
+
+Useful exploration commands:
+- Explore nearby unknown sectors safely to expand the local map
+- Explore from the current sector toward the nearest unknown exits, returning before fuel is low
+- Scout around known ports and megaports for new markets and route connections
 
 Best known safe trade leads:
 - Neuro-Symbolics usually has the strongest reliable margin, about 21 to 23 credits per unit.

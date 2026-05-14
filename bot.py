@@ -831,7 +831,8 @@ async def run_bot(transport: BaseTransport):
             transport.input(),
             transport_input_timing_logger,
             user_aggregator,
-            game_context_injector,
+            # Temporarily disabled: do not append summarized game events to LLM context.
+            # game_context_injector,
             llm,
             wait_tag_filter,
             bot_speech_logger,
@@ -970,7 +971,8 @@ async def run_bot(transport: BaseTransport):
     async def on_app_message(transport, message, sender):
         logger.debug(f"[APP MESSAGE][{sender}] {message}")
         log_game_user_speech_boundary(message)
-        game_context.handle_message(message)
+        # Temporarily disabled: do not summarize incoming game events for LLM context.
+        # game_context.handle_message(message)
         text = game_turns.handle_message(message)
         if text:
             await queue_game_turn(text)

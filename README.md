@@ -64,11 +64,36 @@ Set `GB_TASK_PROMPT_PATH` to use a different task prompt, such as exploration or
 GB_TASK_PROMPT_PATH=task_prompts/exploration.md uv run bot.py --transport daily
 ```
 
+## Implementation history
+
+The `bot-vN.py` files are progressive snapshots of how the bot evolved from a
+stock Pipecat voice agent into something that can actually converse with
+another bot. `bot.py` is the live entrypoint and tracks the newest version.
+
+- **`bot-v1.py` — naive audio.** As close as possible to a generated Pipecat
+  example: Daily transport, mic in, Silero VAD, Deepgram STT, OpenAI LLM,
+  Cartesia TTS. No accommodations for the fact that the "user" on the other end
+  is itself a TTS bot.
+- **`bot-v2.py` — naive audio, tolerant turn-taking.** The minimum changes to
+  `bot-v1` needed to compensate for listening to another bot instead of a
+  human. Extends `SileroVADAnalyzer` `stop_secs` to 3.0 and adds a
+  `SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=3.0)` so the Ship AI's
+  natural inter-sentence pauses don't get mistaken for end-of-turn.
+- **`bot-v3.py` — smart audio.** Drops audio input entirely
+  (`audio_in_enabled=False`) and instead reconstructs the Ship AI's turns from
+  Daily app-messages (`bot-transcription` / `bot-output` / `ship.speech_stopped`).
+  Adds the `<wait>` protocol: the LLM emits a literal `<wait>` token when it has
+  nothing to say, and `WaitTagFilter` suppresses it before TTS. This is what
+  `bot.py` currently runs.
+
 ## Project Structure
 
 ```
 gb-bot/
-├── bot.py                  # Main bot implementation
+├── bot.py                  # Live bot (currently == bot-v3.py)
+├── bot-v1.py               # Naive audio baseline
+├── bot-v2.py               # v1 + extended turn-end timeouts
+├── bot-v3.py               # Smart audio: app-messages + <wait>
 ├── system_prompt.md        # General Gradient Bang instructions
 ├── task_prompts/
 │   └── trading.md          # Default task-specific instructions
@@ -76,8 +101,8 @@ gb-bot/
 ├── Dockerfile              # Container image for Pipecat Cloud
 ├── pcc-deploy.toml         # Pipecat Cloud deployment config
 ├── uv.lock                 # Locked Python dependencies
-├── .gitignore           # Git ignore patterns
-└── README.md            # This file
+├── .gitignore              # Git ignore patterns
+└── README.md               # This file
 ```
 
 ## Deploying to Pipecat Cloud

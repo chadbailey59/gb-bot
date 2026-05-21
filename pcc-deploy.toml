@@ -1,5 +1,5 @@
 agent_name = "gb-bot"
-secret_set = "gb-bot-secrets"
+secret_set = "gb-bot-secrets" # pragma: allowlist secret
 agent_profile = "agent-1x"
 
 [scaling]

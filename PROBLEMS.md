@@ -20,9 +20,9 @@ Test scenario:
 
 Important logs:
 
-- `/home/chad/Code/pipecat/logs/voice-deepgram-a-filtered-20260512-221730.log`
-- `/home/chad/Code/pipecat/logs/voice-deepgram-b-filtered-20260512-221741.log`
-- `/home/chad/Code/pipecat/logs/voice-deepgram-onebot-browser-20260512-221804.log`
+- `~/Code/pipecat/logs/voice-deepgram-a-filtered-20260512-221730.log`
+- `~/Code/pipecat/logs/voice-deepgram-b-filtered-20260512-221741.log`
+- `~/Code/pipecat/logs/voice-deepgram-onebot-browser-20260512-221804.log`
 
 The two-bot run showed crosstalk before the browser joined. Each bot received
 `UserAudioRawFrame` frames from the other bot participant's microphone track.
@@ -48,8 +48,8 @@ It does not filter participants.
 
 Relevant Pipecat source:
 
-- `/home/chad/Code/pipecat/examples/voice/voice-deepgram.py`
-- `/home/chad/Code/pipecat/src/pipecat/transports/daily/transport.py`
+- `~/Code/pipecat/examples/voice/voice-deepgram.py`
+- `~/Code/pipecat/src/pipecat/transports/daily/transport.py`
 
 `DailyParams.audio_in_user_tracks` defaults to `True`.
 
@@ -132,7 +132,7 @@ bot can receive that error and repeat the cycle.
 
 Relevant source:
 
-- `/home/chad/Code/pipecat/src/pipecat/processors/frameworks/rtvi/processor.py`
+- `~/Code/pipecat/src/pipecat/processors/frameworks/rtvi/processor.py`
 
 This caused very large logs in the two-bot Pipecat test and is independent of
 Gradient Bang.
@@ -142,7 +142,7 @@ Gradient Bang.
 To test whether the second Pipecat participant was causing the issue by acting
 like an RTVI server, I created a local diagnostic variant:
 
-- `/home/chad/Code/pipecat/examples/voice/voice-deepgram-no-rtvi.py`
+- `~/Code/pipecat/examples/voice/voice-deepgram-no-rtvi.py`
 
 This variant changes the stock Deepgram voice example in two ways:
 
@@ -154,15 +154,15 @@ This variant changes the stock Deepgram voice example in two ways:
 Test run:
 
 - Normal bot log:
-  `/home/chad/Code/pipecat/logs/voice-deepgram-normal-rtvi-filtered-20260512-224440.log`
+  `~/Code/pipecat/logs/voice-deepgram-normal-rtvi-filtered-20260512-224440.log`
 - No-RTVI/dropper bot log:
-  `/home/chad/Code/pipecat/logs/voice-deepgram-no-rtvi-drop-filtered-20260512-224450.log`
+  `~/Code/pipecat/logs/voice-deepgram-no-rtvi-drop-filtered-20260512-224450.log`
 - Room:
-  `https://cloud-87dd58fc03bf474aba6eabe6cc90165f.daily.co/pipecat-6db68184`
+  `https://your-domain.daily.co/pipecat-...`
 - Normal bot participant:
-  `5e98e90b-aafa-4d0f-80d5-bdcb3ee08377`
+  `<normal-bot-participant-id>`
 - No-RTVI bot participant:
-  `647933ef-210c-4ef6-8dbe-49a386d5d76f`
+  `<no-rtvi-bot-participant-id>`
 
 Observed:
 
@@ -177,8 +177,8 @@ Observed:
 Evidence:
 
 ```text
-normal log:    UserAudioRawFrame(... user: 647933ef-210c-4ef6-8dbe-49a386d5d76f, source: microphone ...)
-no-RTVI log:   UserAudioRawFrame(... user: 5e98e90b-aafa-4d0f-80d5-bdcb3ee08377, source: microphone ...)
+normal log:    UserAudioRawFrame(... user: <no-rtvi-bot-participant-id>, source: microphone ...)
+no-RTVI log:   UserAudioRawFrame(... user: <normal-bot-participant-id>, source: microphone ...)
 ```
 
 Counts from the filtered logs:

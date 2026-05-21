@@ -149,6 +149,8 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
 .venv
 env/
@@ -216,3 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Node.js (client/)
+
+# Local runtime output
+logs/

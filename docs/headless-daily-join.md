@@ -11,14 +11,15 @@ From the `gb-bot` repo:
 ```bash
 mkdir -p logs
 LOGFILE="logs/bot-debug-$(date +%Y%m%d-%H%M%S).log"
-LOG_LEVEL=DEBUG uv run bot.py 2>&1 | tee "$LOGFILE"
+LOG_LEVEL=DEBUG GB_LOG_DAILY_JOIN_URL=true uv run bot.py 2>&1 | tee "$LOGFILE"
 ```
 
-Watch the startup output for the Daily room and token. The game bot service logs
-usually include a line like:
+For local reproduction only, `GB_LOG_DAILY_JOIN_URL=true` prints the Daily join
+token into logs. Keep those logs private. The game bot service logs usually
+include a line like:
 
 ```text
-Bot started with runner_args: ... room_url='https://chad-hq.daily.co/pipecat-...' token='...'
+Bot started with runner_args: ... room_url='https://your-domain.daily.co/pipecat-...' token='...'
 ```
 
 Build the join URL as:
@@ -32,7 +33,7 @@ Build the join URL as:
 Use the fresh `ROOM_URL` and `TOKEN` values from the current run:
 
 ```bash
-ROOM_URL='https://chad-hq.daily.co/pipecat-...'
+ROOM_URL='https://your-domain.daily.co/pipecat-...'
 TOKEN='...'
 
 rm -rf /tmp/gb-daily-headless-profile

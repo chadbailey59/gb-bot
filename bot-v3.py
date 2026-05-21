@@ -93,6 +93,15 @@ TASK_PROMPT_PATH = Path(
 )
 
 
+def should_log_daily_join_url() -> bool:
+    return os.environ.get("GB_LOG_DAILY_JOIN_URL", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Gradient Bang Daily voice bot.")
     parser.add_argument(
@@ -783,7 +792,11 @@ async def login_and_start() -> tuple[str, str]:
         room_token = start_data["dailyToken"]
         session_id = start_data.get("sessionId", "?")
         logger.info(f"    Room: {room_url}")
-        logger.info(f"    Join: {room_url}?t={room_token}")
+        if should_log_daily_join_url():
+            logger.warning("    Daily join URL logging is enabled; logs will contain a room token")
+            logger.info(f"    Join: {room_url}?t={room_token}")
+        else:
+            logger.info("    Join: redacted (set GB_LOG_DAILY_JOIN_URL=true for local debugging)")
         logger.info(f"    Session: {session_id}")
         return room_url, room_token
 

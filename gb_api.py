@@ -22,6 +22,15 @@ PASSWORD = os.environ.get("GB_PASSWORD")
 CHARACTER_NAME = os.environ.get("GB_CHARACTER", "HyperionBot")
 
 
+def should_log_daily_join_url() -> bool:
+    return os.environ.get("GB_LOG_DAILY_JOIN_URL", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 async def api_login(session: aiohttp.ClientSession) -> dict:
     if not EMAIL or not PASSWORD:
         raise RuntimeError("GB_EMAIL and GB_PASSWORD are required unless --room-url is provided")
@@ -100,6 +109,10 @@ async def login_and_start() -> tuple[str, str]:
         room_token = start_data["dailyToken"]
         session_id = start_data.get("sessionId", "?")
         logger.info(f"    Room: {room_url}")
-        logger.info(f"    Join: {room_url}?t={room_token}")
+        if should_log_daily_join_url():
+            logger.warning("    Daily join URL logging is enabled; logs will contain a room token")
+            logger.info(f"    Join: {room_url}?t={room_token}")
+        else:
+            logger.info("    Join: redacted (set GB_LOG_DAILY_JOIN_URL=true for local debugging)")
         logger.info(f"    Session: {session_id}")
         return room_url, room_token
